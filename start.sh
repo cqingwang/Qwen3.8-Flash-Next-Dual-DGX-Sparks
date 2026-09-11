@@ -5,21 +5,13 @@
 #
 # Based on: https://github.com/getrefined/Qwen3.8-Flash-Next-NVFP4-vLLM-DGX-Spark
 #
-# Weight distribution (default: rsync). Each node keeps its own copy of the
-# checkpoint in ~/.cache/huggingface; the worker copy is rsync'd from the head
-# once and reused. Set NFS_SHARE=true (or pass --nfs) to instead export the head
-# cache over NFS on the ConnectX link, so the worker keeps no local copy — see
-# "NFS weight sharing (optional)" in the README for the trade-offs.
+# Model weights are preloaded on both nodes and are mounted read-only into the
+# containers from MODEL_PATH. The launch path never creates an HF cache view,
+# symlink, or model copy.
 #
 # Usage:
-#   ./download.sh             # fetch NVFP4 onto the head (optional; start.sh can too)
-#   ./start.sh                # download on head if needed → sync to worker → patch → launch
-#   ./start.sh --no-download  # skip download (weights already cached on head)
-#   ./start.sh --no-launch    # download + sync only, don't start server
-#   ./start.sh --launch       # skip download/sync; apply patch + launch
-#   ./start.sh --nfs          # distribute weights over NFS instead of rsync
-#   ./start.sh --no-nfs       # force rsync distribution (overrides NFS_SHARE=true)
-#   ABLIT=1 ./start.sh        # gated Keys house QSA L3-47 checkpoint (download first)
+#   ./start.sh --launch       # patch + launch MODEL_PATH
+#   ./start.sh --no-launch    # validate the direct model path only
 # ============================================================================
 set -euo pipefail
 
@@ -33,6 +25,21 @@ info()  { echo -e "\033[1;34m[INFO]\033[0m  $*"; }
 ok()    { echo -e "\033[1;32m[ OK ]\033[0m  $*"; }
 warn()  { echo -e "\033[1;33m[WARN]\033[0m  $*"; }
 err()   { echo -e "\033[1;31m[ERR ]\033[0m  $*"; exit 1; }
+
+resolve_direct_model_path() {
+    [[ -n "${MODEL_PATH:-}" ]] || err "MODEL_PATH is required; set the absolute preloaded model directory in .env"
+    [[ "$MODEL_PATH" == /* ]] || err "MODEL_PATH must be an absolute path (got: '$MODEL_PATH')"
+    [[ ! -L "$MODEL_PATH" ]] || err "MODEL_PATH must be the real model directory, not a symlink: $MODEL_PATH"
+    [[ -d "$MODEL_PATH" ]] || err "MODEL_PATH directory does not exist: $MODEL_PATH"
+    [[ -f "$MODEL_PATH/config.json" ]] || err "MODEL_PATH has no config.json: $MODEL_PATH"
+
+    MODEL_PATH="$(cd "$MODEL_PATH" && pwd -P)"
+    CONTAINER_MODEL_PATH="${CONTAINER_MODEL_PATH:-/models}"
+    [[ "$CONTAINER_MODEL_PATH" == /* ]] || err "CONTAINER_MODEL_PATH must be absolute (got: '$CONTAINER_MODEL_PATH')"
+    MODEL_PATH_MODE=direct
+    MODEL_LOAD_PATH="$CONTAINER_MODEL_PATH"
+    MODEL_MOUNT="-v $MODEL_PATH:$CONTAINER_MODEL_PATH:ro"
+}
 
 # ---------------------------------------------------------------------------
 # Load .env
@@ -72,6 +79,7 @@ for var in HEAD_IP WORKER_IP IFACE IB_HCA IB_GID_INDEX MODEL_ID \
 done
 
 WORKER_USER="${WORKER_USER:-}"
+WORKER_SSH="${WORKER_SSH:-}"
 # Numeric sanity: the YaRN guard below does an arithmetic comparison on MAX_MODEL_LEN
 if ! [[ "$MAX_MODEL_LEN" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: MAX_MODEL_LEN must be a positive integer (got: '$MAX_MODEL_LEN')"
@@ -98,14 +106,8 @@ MM_ENCODER_TP_MODE="${MM_ENCODER_TP_MODE:-data}"
 EXTRA_VLLM_ARGS="${EXTRA_VLLM_ARGS:-}"
 EXTRA_DOCKER_ARGS="${EXTRA_DOCKER_ARGS:-}"
 HF_TOKEN="${HF_TOKEN:-}"
-# Weight distribution. false (default) = each node keeps its own ~/.cache/huggingface
-# copy, worker seeded by rsync from the head. true = head exports its cache over NFS
-# on ConnectX and the worker mounts it read-only, keeping no local copy.
-NFS_SHARE="${NFS_SHARE:-false}"
-# Optional: head ConnectX address used as the NFS server (auto-detected from IFACE).
-NFS_SERVER_IP="${NFS_SERVER_IP:-}"
 # Optional overrides from start-fp8.sh (applied after .env so FP8 can share
-# the same cluster config). Weights still live on the head and are NFS-mounted.
+# the same cluster config). The direct MODEL_PATH remains authoritative.
 if [[ -n "${OVERRIDE_MODEL_ID:-}" ]]; then
     MODEL_ID="$OVERRIDE_MODEL_ID"
 fi
@@ -144,6 +146,10 @@ fi
 MTP_DRAFT_VOCAB="${MTP_DRAFT_VOCAB:-}"
 # QSA Triton launch profile: stock | gb10 | path to JSON from files/qsa_gb10/bench_qsa_kernels.py
 QSA_PROFILE="${QSA_PROFILE:-stock}"
+# The direct-path branch skips the legacy HF-cache preparation below, but Step 7
+# always builds the merged hf-overrides payload. Initialize this optional value
+# before either path so set -u cannot turn an absent override into a launch error.
+PLE_EMBEDDING_DTYPE="${PLE_EMBEDDING_DTYPE:-}"
 # Refuse to launch when another process already holds the GPU (both nodes).
 REQUIRE_IDLE_GPU="${REQUIRE_IDLE_GPU:-true}"
 
@@ -158,28 +164,18 @@ fi
 # ---------------------------------------------------------------------------
 # Parse CLI flags
 # ---------------------------------------------------------------------------
-DO_DOWNLOAD="${DO_DOWNLOAD_DEFAULT:-true}"
 DO_LAUNCH=true
-DO_SYNC=true
 
 for arg in "$@"; do
     case "$arg" in
-        --no-download)  DO_DOWNLOAD=false ;;
         --no-launch)    DO_LAUNCH=false ;;
-        --launch)       DO_DOWNLOAD=false; DO_SYNC=false ;;
-        --nfs)          NFS_SHARE=true ;;
-        --no-nfs)       NFS_SHARE=false ;;
+        --launch)       ;;
         -h|--help)
-            echo "Usage: $0 [--no-download] [--no-launch] [--launch] [--nfs|--no-nfs]"
+            echo "Usage: $0 [--launch|--no-launch]"
             echo ""
-            echo "  (default)      Download weights on head, rsync to worker, apply patch, launch"
-            echo "  --no-download  Skip HF download (weights already cached on head)"
-            echo "  --no-launch    Download + sync weights only, don't start vLLM"
-            echo "  --launch       Skip download + sync; apply patch and launch"
-            echo "  --nfs          Share the head cache over NFS instead of rsync (no worker copy)"
-            echo "  --no-nfs       Force rsync distribution even if NFS_SHARE=true in .env"
-            echo "  ABLIT=1        Serve the gated Keys house QSA L3-47 checkpoint"
-            echo "                 (accept the Hugging Face terms, then ABLIT=1 ./download.sh)"
+            echo "  MODEL_PATH     Absolute preloaded model directory on this node"
+            echo "  --launch       Apply runtime patches and launch vLLM (default)"
+            echo "  --no-launch    Validate the direct model path and prepare no container"
             exit 0
             ;;
         *)
@@ -194,30 +190,49 @@ if [[ "$ABLIT" == "1" && "$MODEL_ID" == "$ABLIT_MODEL_ID" ]]; then
     warn "     Compatible ONLY with the nvidia dual-Spark NVFP4 layout (this recipe)."
 fi
 
-# shellcheck source=files/nfs-share.sh
-source "$SCRIPT_DIR/files/nfs-share.sh"
+# ---------------------------------------------------------------------------
+# Resolve the actual preloaded model directory.
+# ---------------------------------------------------------------------------
+resolve_direct_model_path
 
-# ---------------------------------------------------------------------------
 # Worker SSH helper
-# ---------------------------------------------------------------------------
 ssh_worker() {
-    local user_prefix=""
-    if [[ -n "$WORKER_USER" ]]; then
-        user_prefix="${WORKER_USER}@"
+    local destination="${WORKER_SSH:-$WORKER_IP}"
+    if [[ -z "$WORKER_SSH" && -n "$WORKER_USER" ]]; then
+        destination="${WORKER_USER}@${WORKER_IP}"
     fi
-    ssh -o StrictHostKeyChecking=no "${user_prefix}${WORKER_IP}" "$@"
+    ssh -o StrictHostKeyChecking=no "$destination" "$@"
 }
 
 # ---------------------------------------------------------------------------
-# 1. Download the model weights (head node)
+# Direct-path mode. deploy.sh always supplies MODEL_PATH, so the legacy HF cache
+# preparation below is unreachable for managed deployments and is kept only as
+# a compatibility fallback for older standalone environments.
 # ---------------------------------------------------------------------------
-if $DO_DOWNLOAD; then
-    "$SCRIPT_DIR/download.sh" "$MODEL_ID"
+if [[ "$MODEL_PATH_MODE" == direct ]]; then
+    info "=== Step 1: Verify direct model path ==="
+    ok "HEAD   ($HEAD_IP): $MODEL_PATH"
+    printf -v REMOTE_MODEL_PATH_Q '%q' "$MODEL_PATH"
+    ssh_worker "test -d $REMOTE_MODEL_PATH_Q && test -f $REMOTE_MODEL_PATH_Q/config.json" \
+        || err "WORKER ($WORKER_IP) is missing the direct model path: $MODEL_PATH"
+    ok "WORKER ($WORKER_IP): $MODEL_PATH (preloaded; no copy/sync)"
+    REMOTE_HOME=$(ssh_worker 'printf "%s" "$HOME"')
+    [[ -n "$REMOTE_HOME" ]] || err "Could not resolve worker home for the vLLM cache"
+    PLE_CONFIG_DIR="$MODEL_PATH"
+    SNAPSHOT_SHA=""
+else
+    # -------------------------------------------------------------------------
+    # Legacy HF cache mode for standalone callers without MODEL_PATH.
+    # -------------------------------------------------------------------------
+    if $DO_DOWNLOAD; then
+        "$SCRIPT_DIR/download.sh" "$MODEL_ID"
+    fi
 fi
 
 # ---------------------------------------------------------------------------
-# 2. Resolve local cache path
+# 2. Legacy HF cache path (only for unmanaged standalone compatibility).
 # ---------------------------------------------------------------------------
+if [[ "$MODEL_PATH_MODE" != direct ]]; then
 info "=== Step 2: Resolve cache path ==="
 
 HF_CACHE_DIR="${HF_HOME:-$HOME/.cache/huggingface}"
@@ -301,30 +316,8 @@ if [[ "$SNAP_RC" -ne 0 ]]; then
 fi
 ok "Model cache: $HEAD_MODEL_PATH  (snapshot $SNAP)"
 
-# Checkpoints disagree about declaring text_config.ple_embedding_dtype, which is
-# what the patched ple_layer.py dispatches on (nvidia/... omits it and declares
-# the FP8 PLE table only in quantization_config.config_groups). Recover it from
-# the checkpoint and feed it back via --hf-overrides below. Empty = already
-# declared, or no quantized PLE table.
-# PLE config must come from the snapshot the engine will load. refs/main
-# names that revision. Directory order does not. Never guess by ls order.
-# SNAP was already resolved by files/resolve_snapshot.py (complete shards,
-# refs/main preferred).
-PLE_CONFIG_DIR="$HEAD_MODEL_PATH/snapshots/$SNAP"
-if [[ ! -f "$PLE_CONFIG_DIR/config.json" && -f "$MODEL_DIR/config.json" ]]; then
-    PLE_CONFIG_DIR="$MODEL_DIR"
-fi
-if [[ ! -f "$PLE_CONFIG_DIR/config.json" ]]; then
-    err "snapshot $SNAP has no config.json (partial download). Delete $PLE_CONFIG_DIR and re-run ./download.sh $MODEL_ID."
-fi
-PLE_EMBEDDING_DTYPE="${PLE_EMBEDDING_DTYPE:-}"
-if [[ -z "$PLE_EMBEDDING_DTYPE" && -f "$PLE_CONFIG_DIR/config.json" ]]; then
-    PLE_EMBEDDING_DTYPE=$(python3 "$SCRIPT_DIR/files/detect_ple_dtype.py" "$PLE_CONFIG_DIR")
-fi
-if [[ -n "$PLE_EMBEDDING_DTYPE" ]]; then
-    ok "PLE table dtype not declared by checkpoint — overriding to $PLE_EMBEDDING_DTYPE"
-fi
-SNAPSHOT_SHA=$(basename "${PLE_CONFIG_DIR%/}")
+# The legacy branch resolves PLE_CONFIG_DIR from the HF snapshot. Direct mode
+# sets it to the real MODEL_PATH above. Detection is shared after both branches.
 
 # Resolve the worker's HF cache. It mirrors the head's absolute path unless that
 # path lives under $HOME (then the prefix is rewritten to the worker's $HOME), or
@@ -409,6 +402,21 @@ if ! $DO_LAUNCH; then
     else
         err "WORKER ($WORKER_IP): $REMOTE_HUB/models--${ORG}--${NAME} — NOT FOUND. Re-run without --launch to sync."
     fi
+fi
+fi
+
+# Checkpoints disagree about declaring text_config.ple_embedding_dtype, which is
+# what the patched ple_layer.py dispatches on. Recover it from the exact config
+# directory that the engine will load: the real MODEL_PATH in direct mode, or
+# the resolved HF snapshot in legacy mode. Empty means the checkpoint already
+# declares the value, or has no quantized PLE table.
+[[ -n "${PLE_CONFIG_DIR:-}" && -f "$PLE_CONFIG_DIR/config.json" ]] \
+    || err "PLE config directory has no config.json: ${PLE_CONFIG_DIR:-unset}"
+if [[ -z "$PLE_EMBEDDING_DTYPE" ]]; then
+    PLE_EMBEDDING_DTYPE=$(python3 "$SCRIPT_DIR/files/detect_ple_dtype.py" "$PLE_CONFIG_DIR")
+fi
+if [[ -n "$PLE_EMBEDDING_DTYPE" ]]; then
+    ok "PLE table dtype not declared by checkpoint — overriding to $PLE_EMBEDDING_DTYPE"
 fi
 
 # ---------------------------------------------------------------------------
@@ -545,11 +553,11 @@ fi
 #     nvidia/... records only mtp.layers.0, so the lookup misses, the MTP MoE is
 #     built unquantized, and its FP8 weight_scale_inv tensors fail to load. We
 #     bind-mount a config.json carrying both names (what the known-good
-#     local-inference-lab checkpoint ships) — the HF cache is left untouched.
+#     local-inference-lab checkpoint ships) — the actual model directory is left untouched.
 # ---------------------------------------------------------------------------
-if $DO_LAUNCH && [[ -n "${SNAPSHOT_SHA:-}" ]]; then
+if $DO_LAUNCH; then
     info "=== Step 4g: MTP layer-index alias ==="
-    CONTAINER_SNAPSHOT="/root/.cache/huggingface/hub/models--${ORG}--${NAME}/snapshots/${SNAPSHOT_SHA}"
+    CONTAINER_SNAPSHOT="$MODEL_LOAD_PATH"
     rm -f "$SCRIPT_DIR/files/config_patched.json" \
           "$SCRIPT_DIR/files/hf_quant_config_patched.json"
     PATCHED_FILES=$(python3 "$SCRIPT_DIR/files/patch_checkpoint_config.py" \
@@ -801,7 +809,7 @@ print(json.dumps({"text_config": tc}, separators=(",", ":")) if tc else "")
         DOCKER_ARGS+=("$HEAD_MODELOPT_MOUNT")
     fi
     DOCKER_ARGS+=("-e HF_HOME=/root/.cache/huggingface")
-    DOCKER_ARGS+=("-v $HF_CACHE_DIR:/root/.cache/huggingface")
+    DOCKER_ARGS+=("$MODEL_MOUNT")
     DOCKER_ARGS+=("-v $HOME/.cache/vllm:/root/.cache/vllm")
     if [[ -n "$EXTRA_DOCKER_ARGS" ]]; then
         # shellcheck disable=SC2206
@@ -821,11 +829,7 @@ print(json.dumps({"text_config": tc}, separators=(",", ":")) if tc else "")
     else
         info "  ABLIT:      $ABLIT"
     fi
-    if [[ "$NFS_SHARE" == "true" ]]; then
-        info "  Weights:    NFS from $NFS_SERVER_IP (head cache, no worker copy)"
-    else
-        info "  Weights:    local HF cache on each node (worker copy synced from head)"
-    fi
+    info "  Weights:    direct read-only mount $MODEL_PATH -> $MODEL_LOAD_PATH"
     info "  Image:      $IMAGE"
     info "  Nodes:      $HEAD_IP (head, rank 0) + $WORKER_IP (worker, rank 1)"
     info "  TP=$TENSOR_PARALLEL_SIZE  EP=$( [[ "$ENABLE_EXPERT_PARALLEL" == "true" ]] && echo on || echo off )  MTP=$MTP_NUM_SPECULATIVE_TOKENS"
@@ -845,22 +849,9 @@ print(json.dumps({"text_config": tc}, separators=(",", ":")) if tc else "")
     # ---- Worker (rank 1) ----
     info "--- Launching worker (rank 1) on $WORKER_IP ---"
     ssh_worker "docker rm -f vllm-fn >/dev/null 2>&1 || true"
-    ssh_worker "mkdir -p '$REMOTE_HF' ~/.cache/vllm"
-    if [[ "$NFS_SHARE" == "true" ]]; then
-        nfs_ensure_worker_volume recreate
-        if nfs_worker_has_model "hub/models--${ORG}--${NAME}"; then
-            ok "Worker sees checkpoint over NFS"
-        else
-            err "WORKER cannot see hub/models--${ORG}--${NAME} over NFS. Check: docker logs $NFS_CONTAINER"
-        fi
-        WORKER_HF_MOUNT="-v $NFS_VOLUME:/root/.cache/huggingface:ro"
-    else
-        if ! ssh_worker "test -d '$REMOTE_HUB/models--${ORG}--${NAME}'" 2>/dev/null; then
-            err "WORKER is missing $REMOTE_HUB/models--${ORG}--${NAME}. Re-run ./start.sh without --launch to sync, or use --nfs."
-        fi
-        ok "Worker has a local checkpoint copy"
-        WORKER_HF_MOUNT="-v $REMOTE_HF:/root/.cache/huggingface"
-    fi
+    ssh_worker "mkdir -p '$REMOTE_HOME/.cache/vllm'"
+    WORKER_MODEL_MOUNT="$MODEL_MOUNT"
+    ok "Worker model mount: $MODEL_PATH -> $MODEL_LOAD_PATH:ro"
 
     # Worker can't mount head's filesystem — copy the patched file over
     if [[ -n "$WORKER_PLE_MOUNT" ]]; then
@@ -917,10 +908,10 @@ docker run \
     $WORKER_MODELOPT_MOUNT \
     $WORKER_OVERLAY_MOUNTS \
     $OVERLAY_ENV_STR \
-    $WORKER_HF_MOUNT \
+    $WORKER_MODEL_MOUNT \
     -v $REMOTE_HOME/.cache/vllm:/root/.cache/vllm \
     $IMAGE \
-    $MODEL_ID \
+    $MODEL_LOAD_PATH \
     $VLLM_ARGS_STR \
     --node-rank 1 \
     --headless
@@ -979,10 +970,10 @@ docker run \
     $HEAD_MODELOPT_MOUNT \
     $HEAD_OVERLAY_MOUNTS \
     $OVERLAY_ENV_STR \
-    -v $HF_CACHE_DIR:/root/.cache/huggingface \
+    $MODEL_MOUNT \
     -v $HOME/.cache/vllm:/root/.cache/vllm \
     $IMAGE \
-    $MODEL_ID \
+    $MODEL_LOAD_PATH \
     $VLLM_ARGS_STR \
     --node-rank 0 \
     --host 0.0.0.0 \

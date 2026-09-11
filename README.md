@@ -20,28 +20,22 @@ That container runs `GPU_MEMORY_UTILIZATION=0.835`, i.e. the value `.env` / `.en
 - 2 DGX Spark nodes (GB10, 128 GB unified memory, sm_121) connected via ConnectX RoCE/IB
 - Passwordless SSH between nodes
 - Docker on both nodes
-- ~126 GiB free **on each node** for the checkpoint. By default both nodes keep their own copy in `~/.cache/huggingface`; `start.sh` rsyncs the worker copy from the head once. Enable [NFS weight sharing](#nfs-weight-sharing-optional) to skip the worker copy entirely.
+- The same preloaded checkpoint directory must exist on **each node**. `start.sh` mounts that
+  directory read-only into the container; it does not download, rsync, or create an HF cache
+  view. The container sees the model at `/models`.
 
 ## Quick Start
 
 ```bash
-# 1. Edit .env (set IPs, interface, IB HCA, etc.)
+# 1. Edit .env (set IPs, interface, IB HCA, and the real model directory)
 cp .env.sample .env
 vim .env
 
-# 2. Download weights onto the head
-./download.sh
-#    ./download.sh --fp8    # official FP8 instead
-#    ABLIT=1 ./download.sh  # gated Keys house QSA L3-47 (HF_TOKEN + accept terms)
+# 2. Validate the same real directory on both nodes
+./start.sh --no-launch
 
-# 3. Sync to worker, apply patches, launch (NVFP4)
-./start.sh --no-download
-#    or ./start.sh       if you want start.sh to download as well
-#    or ./start.sh --nfs to share the head cache over NFS instead of rsyncing
-#    or ABLIT=1 ./start.sh --no-download
-
-#    Optional — official FP8 instead of NVFP4 (see below):
-#    ./download.sh --fp8 && ./start-fp8.sh --no-download
+# 3. Apply patches and launch (NVFP4)
+./start.sh --launch
 
 # 4. Confirm the KV cache pool that vLLM actually allocated (~11 min after launch)
 docker logs vllm-fn 2>&1 | grep -E "Available KV cache memory|GPU KV cache size"
@@ -53,11 +47,8 @@ docker logs vllm-fn 2>&1 | grep -E "Available KV cache memory|GPU KV cache size"
 
 | Flag | Description |
 |------|-------------|
-| `--no-download` | Skip HF download (weights already in the head cache) |
-| `--no-launch` | Download + distribute weights only, don't start the server |
-| `--launch` | Skip download + sync; apply patches and launch (weights already on both nodes) |
-| `--nfs` | Distribute weights over NFS instead of rsync (see [below](#nfs-weight-sharing-optional)) |
-| `--no-nfs` | Force rsync distribution even if `NFS_SHARE=true` in `.env` |
+| `--no-launch` | Validate the direct model path only |
+| `--launch` | Apply patches and launch using the direct model path |
 | `ABLIT=1` | Env/`.env` flag: serve the gated Keys house QSA L3–47 checkpoint (see [Abliterated checkpoint](#abliterated-checkpoint-ablit)) |
 
 ## Official FP8 checkpoint (optional)
@@ -82,14 +73,14 @@ sets `OVERRIDE_MODEL_ID`.
 
 ## What Happens
 
-1. **Download** — `./download.sh` pulls `MODEL_ID` from `.env` (stock NVFP4) to the **head** HF cache (`./download.sh --fp8` for official FP8; `ABLIT=1 ./download.sh` for the gated Keys house checkpoint).
-2. **Distribute** — by default `rsync` copies the checkpoint into the worker's own `~/.cache/huggingface/hub` over the ConnectX link, skipped when the worker already has it. With `NFS_SHARE=true` / `--nfs` this is replaced by the [NFS share](#nfs-weight-sharing-optional).
-3. **Image sync** — ensures `vllm/vllm-openai:qwen38-flash-next` is on both nodes
-4. **PLE patch** — extracts `ple_layer.py` from the image and patches it into `files/ple_layer_patched.py` (no image rebuild; bind-mounted at runtime)
-5. **MXFP8 patch** — extracts `modelopt.py` and patches it into `files/modelopt_patched.py`, routing the MXFP8 shapes FlashInfer's `mm_mxfp8` cannot run to the BF16 emulation kernel (also bind-mounted)
-6. **Preflight + overlays** — refuses to launch if another process holds a GPU on either node
+1. **Path validation** — verifies `MODEL_PATH` and the same path on the worker; no download, rsync,
+   cache view, or symlink is created.
+2. **Image sync** — ensures `vllm/vllm-openai:qwen38-flash-next` is on both nodes
+3. **PLE patch** — extracts `ple_layer.py` from the image and patches it into `files/ple_layer_patched.py` (no image rebuild; bind-mounted at runtime)
+4. **MXFP8 patch** — extracts `modelopt.py` and patches it into `files/modelopt_patched.py`, routing the MXFP8 shapes FlashInfer's `mm_mxfp8` cannot run to the BF16 emulation kernel (also bind-mounted)
+5. **Preflight + overlays** — refuses to launch if another process holds a GPU on either node
    (`REQUIRE_IDLE_GPU=false` to override); prepares the `FP8_DENSE` / `QSA_PROFILE` bind-mounts
-7. **Launch** — worker (rank 1) starts first, then head (rank 0) serves on `:8888`. Both launch
+6. **Launch** — worker (rank 1) starts first, then head (rank 0) serves on `:8888`. Both launch
    scripts render the same `VLLM_ARGS` array (`EXTRA_VLLM_ARGS` really is appended last now;
    `ENABLE_EXPERT_PARALLEL=false` and `MTP_NUM_SPECULATIVE_TOKENS=0` are honored). The head's
    rendered script is kept as `.last_head_launch.sh` for inspection.
@@ -104,45 +95,12 @@ sets `OVERRIDE_MODEL_ID`.
 
 Both containers are named **`vllm-fn`** (head and worker); `./stop.sh` removes both.
 
-## NFS weight sharing (optional)
+## Direct model path contract
 
-**Off by default.** By default each node keeps its own copy of the checkpoint in
-`~/.cache/huggingface`, and `start.sh` rsyncs the worker's copy from the head once (subsequent
-launches detect it and skip the transfer). That costs ~126 GiB on the worker and one long copy the
-first time, but the worker is then self-sufficient.
-
-Turn NFS sharing on to skip the worker copy entirely — the head exports its HF cache and the worker
-mounts it read-only:
-
-```bash
-NFS_SHARE=true ./start.sh --launch     # or set NFS_SHARE=true in .env
-./start.sh --nfs                       # same, per-run flag
-./start.sh --no-nfs                    # force rsync even with NFS_SHARE=true in .env
-```
-
-A privileged `vllm-fn-nfs` container on the head exports `$HF_CACHE_DIR` over NFSv4 on the ConnectX
-address (`NFS_SERVER_IP`, auto-detected from `IFACE` — do **not** use the `10.0.0.1` loopback
-alias). The worker Docker volume `vllm-fn-hf` mounts it read-only at `/root/.cache/huggingface`.
-
-| | rsync (default) | `NFS_SHARE=true` |
-|---|---|---|
-| Worker disk | ~126 GiB | none |
-| First launch | one full copy, then free | no copy |
-| Every cold start | reads local disk | streams ~126 GiB over ConnectX |
-| Head must stay up | only to launch | **for the whole serving run** |
-| Failure mode | worker cache goes stale silently | share dies → worker loses its weights |
-
-Prefer NFS when worker disk is tight or you re-pull checkpoints often; prefer the default when you
-want the two nodes decoupled. Switching checkpoints is where NFS earns its keep — no re-sync.
-
-Notes when it is on:
-
-- `./stop.sh` leaves the share up so the next `--launch` does not rebuild it; `./stop.sh --nfs`
-  tears it down and removes the worker volume. Kernel NFS in Docker can ignore SIGKILL when
-  rpcbind is in D-state, so that path has a 15 s timeout and reports if the container survives.
-- **Do not stop `vllm-fn-nfs` while vLLM is loading or running** — the worker reads shards from it.
-- `./check-weights.sh` follows `NFS_SHARE`: it verifies the worker's local copy by default, or the
-  NFS volume when sharing is on.
+`MODEL_PATH` is an absolute, real directory such as
+`/opt/models/nvidia/Qwen3.8-Flash-Next-NVFP4`. Both nodes must expose the same path.
+The launcher verifies `config.json`, mounts `MODEL_PATH:ro` at `CONTAINER_MODEL_PATH` (default
+`/models`), and passes `/models` to vLLM. The `hub/models--...` compatibility view is not used.
 
 ## .env Reference
 
@@ -180,8 +138,8 @@ every measurement in this README.
 | `IMAGE` | `vllm/vllm-openai:qwen38-flash-next` | same | Day-0 image |
 | `VLLM_ALLOW_LONG_MAX_MODEL_LEN` | `1` | `1` | Required when `MAX_MODEL_LEN` > 262144 |
 | `MASTER_PORT` | `50000` | `50000` | Distributed coordination port |
-| `NFS_SHARE` | `false` | `false` | `true` → share the head HF cache over NFS instead of rsyncing a worker copy ([details](#nfs-weight-sharing-optional)) |
-| `NFS_SERVER_IP` | *(unset → `IFACE` IPv4)* | *(unset → `10.0.22.1`)* | Head ConnectX address that exports the HF cache. Only used when `NFS_SHARE=true`. Do **not** use the `10.0.0.1` loopback alias |
+| `MODEL_PATH` | `/opt/models/nvidia/Qwen3.8-Flash-Next-NVFP4` | direct absolute directory | Preloaded model directory on each node; must not be an HF cache path or symlink |
+| `CONTAINER_MODEL_PATH` | `/models` | `/models` | Read-only container mount target passed to vLLM |
 | `EXTRA_VLLM_ARGS` / `EXTRA_DOCKER_ARGS` | unset | unset | Escape hatches (`EXTRA_VLLM_ARGS` is appended last) |
 | `HF_TOKEN` | unset | unset | Required for `ABLIT=1` (gated Hugging Face repo). Environment wins over `.env` |
 
@@ -203,26 +161,22 @@ the same nvidia dual-Spark NVFP4 layout with a house residual-writer projection 
 `FP8_DENSE=true`. `./start-fp8.sh` and `FP8_DENSE=true` still win if you set them, and
 `ABLIT=1` is ignored for checkpoint selection in those cases.
 
-That Hugging Face repo is **gated**. `ABLIT=1 ./download.sh` **fails immediately** if
-`HF_TOKEN` is unset and prints the steps below. Set the token, **Accept the terms on that
-page**, then download the **full** snapshot (same nvidia NVFP4 size class, ~133 GiB). Stock
-and ablit caches sit side by side; flipping `ABLIT` is the only switch. `start.sh` rsyncs
-whichever checkpoint `ABLIT` selected onto the worker (or shares it over NFS). An interrupted
-download is not treated as ready — rerun `ABLIT=1 ./download.sh` to resume.
+That Hugging Face repo is **gated**. Download and acceptance are outside this launcher. After
+preloading the full snapshot on both nodes, set `MODEL_ID` for the serving label and point
+`MODEL_PATH` at the actual ablit directory. `start.sh` then validates and mounts that directory
+directly; it does not select, copy, or cache weights.
 
 ```bash
-# 1. In .env: set ABLIT=1 and uncomment HF_TOKEN (or export both for this shell)
-# 2. In the browser, accept the terms on:
+# 1. In .env: set MODEL_ID and MODEL_PATH to the preloaded ablit checkpoint
+# 2. Obtain access and accept the terms on:
 #    https://huggingface.co/drowzeys/keys-Qwen3.8-Flash-Next-NVFP4-dual-ablit-house-qsa-L3-47
-HF_TOKEN=hf_... ABLIT=1 ./download.sh
-ABLIT=1 ./start.sh
+MODEL_ID=drowzeys/keys-Qwen3.8-Flash-Next-NVFP4-dual-ablit-house-qsa-L3-47 \
+MODEL_PATH=/opt/models/drowzeys/keys-Qwen3.8-Flash-Next-NVFP4-dual-ablit-house-qsa-L3-47 \
+./start.sh --launch
 ```
 
-`HF_TOKEN` is required for `ABLIT=1`. A 403 means access has not been granted yet —
-**Accept the terms on that page**, then retry with `HF_TOKEN` set. Unlike most knobs in
-this launcher, `ABLIT` and `HF_TOKEN` honour the environment over `.env`, so
-`ABLIT=1 ./start.sh` works even when `.env` still has `ABLIT=0`. Switch back with
-`ABLIT=0 ./start.sh` (stock `MODEL_ID`; no re-download if that cache is already complete).
+The model files must already exist at `MODEL_PATH` on both nodes. The old `ABLIT` and
+`HF_TOKEN` download workflow is not part of the direct-path launcher.
 
 **The gate is a binding agreement, not a download button.** The checkpoint ships its own
 responsible-use terms, and requesting access means accepting them. In summary: you must be
@@ -409,12 +363,10 @@ Container: `vllm/vllm-openai:qwen38-flash-next` (`sha256:d464f3b4…`, ~20.6 GB,
 Env injected by `start.sh`: `PLE_QUANT_OVERRIDE=fp8`, `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`,
 `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1`, `NCCL_IB_HCA`/`NCCL_IB_GID_INDEX`/`NCCL_IB_DISABLE=0`,
 `{GLOO,NCCL,TP}_SOCKET_IFNAME=$IFACE`, `NCCL_DEBUG=WARN`.
-Mounts: patched `ple_layer.py` → `/usr/local/lib/python3.12/dist-packages/vllm/models/qwen3_8_flash_next/nvidia/ple_layer.py:ro`,
+Mounts: actual `MODEL_PATH` → `CONTAINER_MODEL_PATH:ro`, patched `ple_layer.py` → `/usr/local/lib/python3.12/dist-packages/vllm/models/qwen3_8_flash_next/nvidia/ple_layer.py:ro`,
 patched `modelopt.py` → `…/vllm/model_executor/layers/quantization/modelopt.py:ro`,
-`$HOME/.cache/vllm` → `/root/.cache/vllm` on each node. HuggingFace cache: head bind-mounts
-`$HF_CACHE_DIR`; the worker bind-mounts its own `~/.cache/huggingface` by default, or the NFS
-volume `vllm-fn-hf` read-only when `NFS_SHARE=true`.
-Container runs as root — the mount target must be `/root`, or offline HF lookups fail.
+`$HOME/.cache/vllm` → `/root/.cache/vllm` on each node. The model is not mounted through
+`/root/.cache/huggingface`; the container runs as root.
 
 **Versions / backends actually selected:**
 
@@ -847,7 +799,7 @@ reference; the numbers above supersede these.
   `supported_kv_cache_dtypes = ["auto", "bfloat16"]`; passing `--kv-cache-dtype fp8` to an
   unpatched image raises `Qwen3.8-Flash-Next QSA requires a BF16 main KV cache`. Do not hand-roll
   the flag — set `KV_CACHE_DTYPE` in `.env` so the patch is applied with it.
-- **`.env` beats the environment**, except `ABLIT` and `HF_TOKEN`. `start.sh` sources `.env`
+- **`.env` beats the environment**. `start.sh` sources `.env`
   after reading the environment, so `KV_CACHE_DTYPE=fp8 ./start.sh` is silently ignored for
   any key that `.env` already defines. Edit `.env`, or check the `KV dtype:` line in the
   launch summary. `ABLIT=1 ./start.sh` and `HF_TOKEN=hf_... ./download.sh` **do** win over
@@ -855,12 +807,8 @@ reference; the numbers above supersede these.
 - **MTP >1 token** logs `running multiple times of forward on same MTP layer, which may result
   in lower acceptance rate`, and the QSA backend can't fuse multi-step draft decode (it rebuilds
   attention metadata per draft step). `MTP_NUM_SPECULATIVE_TOKENS=1` is the safe comparison point.
-- `./stop.sh` force-removes `vllm-fn` on both nodes. If the NFS share is in use it stays up
-  so the next `--launch` does not rebuild it; `./stop.sh --nfs` tears it down too.
-  FlashInfer autotune cache in `~/.cache/vllm` is the only per-node state that carries over.
-- **`NFS_SHARE=true` only:** do not stop `vllm-fn-nfs` while vLLM is loading or running — the
-  worker reads shards from it. Cold start streams ~126 GiB over CX7 (lazy safetensors); once
-  weights are in GPU memory the share is idle.
+- `./stop.sh` force-removes `vllm-fn` on both nodes. The direct model directory remains untouched;
+  FlashInfer autotune cache in `~/.cache/vllm` is the only per-node runtime state that carries over.
 - **Weights corruption is silent until load.** A shard corrupted mid-download keeps its
   apparent size close enough that `check-weights.sh` (size + file count) passes, then the
   engine dies at ~33% weight load with `safe_open` → "incomplete metadata, file not fully
@@ -922,11 +870,11 @@ weights. It does not redistribute them and does not relicense them.
 
 | Script | Purpose |
 |--------|---------|
-| `download.sh` | fetch weights onto the **head** (`ABLIT=1` for the gated Keys house snapshot — requires `HF_TOKEN` and accepted Hugging Face terms; `--fp8` for official FP8); `start.sh` handles the worker |
-| `start.sh` | optional download on head → distribute to worker (rsync, or NFS with `--nfs`) → verify complete snapshot → image sync → PLE + MXFP8 patches → launch rank 1 then rank 0. `ABLIT=1` selects the Keys house checkpoint |
+| `download.sh` | optional external helper for preparing weights; it is not called by the direct-path launcher |
+| `start.sh` | verify the real `MODEL_PATH` on both nodes → image sync → PLE + MXFP8 patches → read-only mount → launch rank 1 then rank 0 |
 | `start-fp8.sh` | optional official FP8 path (`Qwen/Qwen3.8-Flash-Next-FP8`); native 262K, no YaRN; **~500k KV cache tokens** on this kit |
-| `stop.sh` | `docker rm -f vllm-fn` on worker, then head (`--nfs` also stops the share) |
-| `check-weights.sh` | verify the checkpoint on the head and on the worker (local copy, or over NFS when `NFS_SHARE=true`) |
+| `stop.sh` | `docker rm -f vllm-fn` on worker, then head |
+| `check-weights.sh` | verify the externally preloaded checkpoint files on the head and worker |
 | `check-weights.sh --verify` | per-file SHA-256 verification against the Hugging Face manifest (~1 min read-only) |
 | `check-weights.sh --dry-run` | plan `--verify` (fetch manifest, check presence/size) without hashing or scp |
 | `check-weights.sh --dry-run` | plan `--verify` (fetch manifest, check presence/size) without hashing or scp |
